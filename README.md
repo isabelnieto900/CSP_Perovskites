@@ -33,7 +33,7 @@ CSP_Perovskites/
   results/                     # salidas (figuras, tablas, SHAP); no se versiona
 ```
 
-## Instalación en otra máquina
+## Instalación
 
 Requisitos: **Python 3.12 o superior** (las versiones fijadas en `requirements.txt` lo necesitan) y `git`.
 
@@ -144,12 +144,3 @@ result = ev.run_repeated(df_decor, ds.make_m4_split,
                          models.get_classifiers(["LightGBM", "Extra Trees"]), n_runs=3)
 ev.summarize(result.runs, as_text=True)
 ```
-
-## Diferencias con el código original
-
-- **Sin fuga de datos**: el código original aplicaba SMOTE a todo el dataset antes de dividir en train y test, por lo que el test contenía muestras sintéticas. Ahora se divide primero y SMOTE se aplica solo a train, como describe el paper. Esto baja las accuracies respecto a las reportadas.
-- **Polimorfos en M7**: el test real de M7 incluye compuestos con varios sistemas cristalinos (mismo vector de features, distinta etiqueta), que un clasificador de etiqueta única no puede acertar por completo. `DROP_POLYMORPHS_FROM_TEST = True` permite evaluar sin ellos.
-- **Escalado**: min-max (como en el paper) dentro del pipeline, ajustado solo con train. Antes había un `StandardScaler` global antes del split y otro dentro del pipeline.
-- **Corridas y validación cruzada**: 10 corridas y 5 folds por defecto (antes 5 y 3).
-- **SHAP**: las importancias de cada modelo se normalizan antes de promediar, en lugar de dividir manualmente LightGBM entre 10.
-- **Tabla 5 y Wilcoxon**: se agregó el código de las métricas multietiqueta y del test de Wilcoxon.
