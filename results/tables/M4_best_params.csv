@@ -1,0 +1,13 @@
+,best_params
+Logistic Regression,{'clf__C': 10}
+Naive Bayes,{}
+K-Nearest Neighbors,"{'clf__n_neighbors': 3, 'clf__weights': 'distance'}"
+Decision Tree,"{'clf__criterion': 'gini', 'clf__max_depth': 35, 'clf__min_samples_split': 2}"
+Random Forest,"{'clf__max_depth': 50, 'clf__max_features': 'sqrt', 'clf__n_estimators': 500}"
+Extra Trees,"{'clf__max_depth': None, 'clf__n_estimators': 300}"
+AdaBoost,"{'clf__learning_rate': 0.1, 'clf__n_estimators': 200}"
+Gradient Boosting,"{'clf__learning_rate': 0.1, 'clf__max_depth': 4, 'clf__n_estimators': 200}"
+XGBoost,"{'clf__learning_rate': 0.1, 'clf__max_depth': 4, 'clf__n_estimators': 200}"
+LightGBM,"{'clf__learning_rate': 0.1, 'clf__n_estimators': 200, 'clf__num_leaves': 31}"
+Support Vector Machine,"{'clf__estimator__C': 1, 'clf__estimator__gamma': 'scale'}"
+Neural Network,"{'clf__alpha': 0.001, 'clf__hidden_layer_sizes': (100, 50), 'clf__learning_rate': 'constant'}"
