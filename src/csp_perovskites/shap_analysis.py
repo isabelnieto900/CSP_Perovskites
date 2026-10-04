@@ -11,7 +11,7 @@ from sklearn.base import BaseEstimator, clone
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
-from .config import RANDOM_STATE, TOP_MODELS
+from .config import N_JOBS, RANDOM_STATE, TOP_MODELS
 from .datasets import Split
 from .models import get_classifiers
 
@@ -49,11 +49,13 @@ def explain_models(
     models: dict[str, BaseEstimator] | None = None,
     max_samples: int | None = None,
     seed: int = RANDOM_STATE,
+    n_jobs: int = N_JOBS,
     verbose: bool = True,
 ) -> dict[str, ShapResult]:
     """Fit each tree model on the training split and compute TreeSHAP on the test split.
 
-    Trees are scale-invariant, so models are fit on unscaled features.
+    Trees are scale-invariant, so models are fit on unscaled features. Models are
+    processed one at a time, each using ``n_jobs`` threads.
     """
     if models is None:
         models = {name: est for name, (est, _) in get_classifiers(TOP_MODELS).items()}
@@ -71,7 +73,7 @@ def explain_models(
         start = time.perf_counter()
         model = clone(estimator)
         if "n_jobs" in model.get_params():
-            model.set_params(n_jobs=-1)
+            model.set_params(n_jobs=n_jobs)
         model.fit(split.X_train, y_train)
         acc = accuracy_score(y_test, model.predict(split.X_test))
 

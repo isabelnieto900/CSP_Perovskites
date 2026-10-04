@@ -7,6 +7,7 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from scipy.stats import wilcoxon
 from sklearn.base import BaseEstimator
 from sklearn.metrics import (
@@ -22,7 +23,7 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
-from .config import CV_FOLDS, N_RUNS, RANDOM_STATE, TOP_MODELS
+from .config import CV_FOLDS, N_JOBS, N_RUNS, RANDOM_STATE, TOP_MODELS
 from .datasets import BinarySplits, Split
 from .models import ModelSpec, build_pipeline
 
@@ -71,7 +72,7 @@ def fit_model(
     cv: int = CV_FOLDS,
     best_params: dict | None = None,
     scoring: str = "accuracy",
-    n_jobs: int = -1,
+    n_jobs: int = N_JOBS,
     seed: int = RANDOM_STATE,
 ) -> tuple[Pipeline, dict]:
     """Fit a scaler+classifier pipeline, grid-searching unless ``best_params`` is given."""
@@ -93,6 +94,36 @@ def fit_model(
     return search.best_estimator_, search.best_params_
 
 
+def _encode_labels(split: Split) -> tuple[np.ndarray, np.ndarray, int]:
+    encoder = LabelEncoder().fit(pd.concat([split.y_train, split.y_test]))
+    return encoder.transform(split.y_train), encoder.transform(split.y_test), len(encoder.classes_)
+
+
+def _score_fitted(name: str, model: Pipeline, split: Split, y_test, n_classes: int, fit_time: float) -> dict:
+    start = time.perf_counter()
+    y_pred = model.predict(split.X_test)
+    y_prob = model.predict_proba(split.X_test) if hasattr(model, "predict_proba") else None
+    predict_time = time.perf_counter() - start
+    scores = multiclass_metrics(y_test, y_pred, y_prob, n_classes)
+    return {"model": name, **scores, "fit_time": fit_time, "predict_time": predict_time}
+
+
+def _fit_and_score(
+    name: str, estimator: BaseEstimator, params: dict, split: Split, scaler: str | None, **extra
+) -> dict:
+    """Worker task: fit with fixed hyperparameters and return only the scores."""
+    y_train, y_test, n_classes = _encode_labels(split)
+    start = time.perf_counter()
+    model, _ = fit_model(estimator, {}, split.X_train, y_train, scaler=scaler, best_params=params)
+    row = _score_fitted(name, model, split, y_test, n_classes, time.perf_counter() - start)
+    return {**row, **extra}
+
+
+def _print_scores(row: dict, prefix: str = "") -> None:
+    print(f"  {prefix}{row['model']:<24} acc={row['accuracy']:.4f}  f1={row['f1_macro']:.4f}  "
+          f"auc={row['roc_auc']:.4f}  ({row['fit_time']:.1f}s)", flush=True)
+
+
 def evaluate_models(
     split: Split,
     classifiers: dict[str, ModelSpec],
@@ -100,14 +131,15 @@ def evaluate_models(
     scaler: str | None = "minmax",
     cv: int = CV_FOLDS,
     best_params: dict[str, dict] | None = None,
-    n_jobs: int = -1,
+    n_jobs: int = N_JOBS,
     seed: int = RANDOM_STATE,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, dict], dict[str, Pipeline]]:
-    """Fit every classifier on ``split`` and score it on the (real) test set."""
-    encoder = LabelEncoder().fit(pd.concat([split.y_train, split.y_test]))
-    y_train, y_test = encoder.transform(split.y_train), encoder.transform(split.y_test)
-    n_classes = len(encoder.classes_)
+    """Fit every classifier on ``split`` and score it on the (real) test set.
+
+    Models are processed one after another; ``n_jobs`` parallelises each grid search.
+    """
+    y_train, y_test, n_classes = _encode_labels(split)
 
     rows, params, fitted = [], {}, {}
     for name, (estimator, grid) in classifiers.items():
@@ -117,19 +149,11 @@ def evaluate_models(
             scaler=scaler, cv=cv, best_params=(best_params or {}).get(name),
             n_jobs=n_jobs, seed=seed,
         )
-        fit_time = time.perf_counter() - start
-
-        start = time.perf_counter()
-        y_pred = model.predict(split.X_test)
-        y_prob = model.predict_proba(split.X_test) if hasattr(model, "predict_proba") else None
-        predict_time = time.perf_counter() - start
-
-        scores = multiclass_metrics(y_test, y_pred, y_prob, n_classes)
-        rows.append({"model": name, **scores, "fit_time": fit_time, "predict_time": predict_time})
+        row = _score_fitted(name, model, split, y_test, n_classes, time.perf_counter() - start)
+        rows.append(row)
         fitted[name] = model
         if verbose:
-            print(f"  {name:<24} acc={scores['accuracy']:.4f}  f1={scores['f1_macro']:.4f}  "
-                  f"auc={scores['roc_auc']:.4f}  ({fit_time:.1f}s)")
+            _print_scores(row)
     return pd.DataFrame(rows), params, fitted
 
 
@@ -149,29 +173,54 @@ def run_repeated(
     cv: int = CV_FOLDS,
     scaler: str | None = "minmax",
     retune_each_run: bool = False,
-    n_jobs: int = -1,
+    n_jobs: int = N_JOBS,
     verbose: bool = True,
 ) -> RepeatedResult:
     """Repeat split -> fit -> score with seeds ``seed + i``.
 
-    Hyperparameters are tuned on the first run and reused afterwards unless
-    ``retune_each_run`` is set.
+    Hyperparameters are tuned on the first run (grid search parallelised over
+    ``n_jobs``) and reused afterwards; the remaining runs x models fits are then
+    executed in parallel. With ``retune_each_run`` every run is tuned sequentially.
+    Results do not depend on ``n_jobs``.
     """
-    frames, best_params = [], None
-    for i in range(n_runs):
-        run_seed = seed + i
+    if verbose:
+        print(f"Run 1/{n_runs} (seed={seed}): tuning hyperparameters", flush=True)
+    scores, best_params, _ = evaluate_models(
+        split_fn(df, seed=seed), classifiers, scaler=scaler, cv=cv,
+        n_jobs=n_jobs, seed=seed, verbose=verbose,
+    )
+    frames = [scores.assign(run=0, seed=seed)]
+    remaining = range(1, n_runs)
+
+    if retune_each_run:
+        for i in remaining:
+            if verbose:
+                print(f"Run {i + 1}/{n_runs} (seed={seed + i})", flush=True)
+            scores, _, _ = evaluate_models(
+                split_fn(df, seed=seed + i), classifiers, scaler=scaler, cv=cv,
+                n_jobs=n_jobs, seed=seed + i, verbose=verbose,
+            )
+            frames.append(scores.assign(run=i, seed=seed + i))
+    elif len(remaining):
+        splits = {i: split_fn(df, seed=seed + i) for i in remaining}
+        tasks = [
+            delayed(_fit_and_score)(name, estimator, best_params[name], splits[i], scaler, run=i, seed=seed + i)
+            for i in remaining
+            for name, (estimator, _) in classifiers.items()
+        ]
         if verbose:
-            print(f"Run {i + 1}/{n_runs} (seed={run_seed})")
-        split = split_fn(df, seed=run_seed)
-        scores, params, _ = evaluate_models(
-            split, classifiers, scaler=scaler, cv=cv,
-            best_params=None if retune_each_run else best_params,
-            n_jobs=n_jobs, seed=run_seed, verbose=verbose,
-        )
-        if best_params is None:
-            best_params = params
-        frames.append(scores.assign(run=i, seed=run_seed))
-    return RepeatedResult(pd.concat(frames, ignore_index=True), best_params or {})
+            print(f"Runs 2-{n_runs}: {len(tasks)} fits in parallel (n_jobs={n_jobs})", flush=True)
+        rows = []
+        for row in Parallel(n_jobs=n_jobs, return_as="generator_unordered")(tasks):
+            rows.append(row)
+            if verbose:
+                _print_scores(row, prefix=f"run {row['run'] + 1:>2}  ")
+        frames.append(pd.DataFrame(rows))
+
+    order = {name: k for k, name in enumerate(classifiers)}
+    runs = pd.concat(frames, ignore_index=True)
+    runs = runs.sort_values(["run", "model"], key=lambda s: s.map(order) if s.name == "model" else s)
+    return RepeatedResult(runs.reset_index(drop=True), best_params)
 
 
 def summarize(runs: pd.DataFrame, metrics: list[str] | None = None, as_text: bool = False) -> pd.DataFrame:
@@ -213,12 +262,14 @@ def evaluate_binary(
     scaler: str | None = "minmax",
     tune: bool = False,
     cv: int = CV_FOLDS,
-    n_jobs: int = -1,
+    n_jobs: int = N_JOBS,
     seed: int = RANDOM_STATE,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     """One-vs-all classifiers per crystal system, scored on the real held-out test set.
 
+    Without ``tune`` all systems x models fits run in parallel over ``n_jobs``;
+    with ``tune`` they run one after another, each grid search parallelised.
     Returns the accuracy table (models x systems, in %) and, for each model, the
     0/1 multilabel prediction matrix on the test set.
     """
@@ -226,21 +277,35 @@ def evaluate_binary(
     accuracy = pd.DataFrame(index=list(classifiers), columns=systems, dtype=float)
     predictions = {name: pd.DataFrame(0, index=splits.Y_test.index, columns=systems) for name in classifiers}
 
-    for system in systems:
-        X_bal, y_bal = splits.train[system]
+    jobs = [
+        (system, name, estimator, grid if tune else {})
+        for system in systems
+        for name, (estimator, grid) in classifiers.items()
+    ]
+    if tune:
+        results = (
+            _binary_task(system, name, est, grid, *splits.train[system], splits.X_test, scaler, cv, n_jobs, seed)
+            for system, name, est, grid in jobs
+        )
+    else:
         if verbose:
-            print(f"{system}:")
-        for name, (estimator, grid) in classifiers.items():
-            model, _ = fit_model(
-                estimator, grid if tune else {}, X_bal, y_bal,
-                scaler=scaler, cv=cv, n_jobs=n_jobs, seed=seed,
-            )
-            y_pred = model.predict(splits.X_test)
-            predictions[name][system] = np.asarray(y_pred).astype(int)
-            accuracy.loc[name, system] = accuracy_score(splits.Y_test[system], y_pred) * 100
-            if verbose:
-                print(f"  {name:<24} acc={accuracy.loc[name, system]:.2f}%")
+            print(f"{len(jobs)} fits in parallel (n_jobs={n_jobs})", flush=True)
+        results = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
+            delayed(_binary_task)(system, name, est, grid, *splits.train[system], splits.X_test, scaler, cv, 1, seed)
+            for system, name, est, grid in jobs
+        )
+
+    for system, name, y_pred in results:
+        predictions[name][system] = y_pred
+        accuracy.loc[name, system] = accuracy_score(splits.Y_test[system], y_pred) * 100
+        if verbose:
+            print(f"  {system:<13} {name:<24} acc={accuracy.loc[name, system]:.2f}%", flush=True)
     return accuracy, predictions
+
+
+def _binary_task(system, name, estimator, grid, X, y, X_test, scaler, cv, n_jobs, seed):
+    model, _ = fit_model(estimator, grid, X, y, scaler=scaler, cv=cv, n_jobs=n_jobs, seed=seed)
+    return system, name, np.asarray(model.predict(X_test)).astype(int)
 
 
 def multilabel_report(

@@ -22,6 +22,8 @@ TEST_SIZE = 0.2
 CORR_THRESHOLD = 0.9
 N_RUNS = 10
 CV_FOLDS = 5
+# Parallel worker processes (-1 = all cores). Each worker trains single-threaded models.
+N_JOBS = int(os.environ.get("CSP_N_JOBS", -1))
 
 TARGET = "crystal_system"
 META_COLS = ["Formula", "A", "B"]

@@ -2,6 +2,7 @@
 
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import (
     AdaBoostClassifier,
     ExtraTreesClassifier,
@@ -31,6 +32,8 @@ SCALERS = {
 def get_classifiers(names: list[str] | None = None, random_state: int = RANDOM_STATE) -> dict[str, ModelSpec]:
     """Return ``{name: (estimator, param_grid)}``; grid keys target the ``clf`` pipeline step."""
     rs = random_state
+    # Every model trains single-threaded: parallelism comes from running many
+    # fits at once (GridSearchCV / joblib), and nested threading would oversubscribe.
     registry: dict[str, ModelSpec] = {
         # liblinear is binary-only in scikit-learn >= 1.8, so it is not in the grid
         "Logistic Regression": (LogisticRegression(max_iter=1000), {
@@ -64,20 +67,20 @@ def get_classifiers(names: list[str] | None = None, random_state: int = RANDOM_S
             "clf__learning_rate": [0.05, 0.1],
             "clf__max_depth": [3, 4],
         }),
-        "XGBoost": (XGBClassifier(random_state=rs), {
+        "XGBoost": (XGBClassifier(random_state=rs, n_jobs=1), {
             "clf__n_estimators": [100, 200],
             "clf__learning_rate": [0.05, 0.1],
             "clf__max_depth": [3, 4],
         }),
-        # n_jobs=1 avoids thread oversubscription under GridSearchCV(n_jobs=-1)
         "LightGBM": (LGBMClassifier(random_state=rs, verbose=-1, n_jobs=1), {
             "clf__n_estimators": [100, 200],
             "clf__learning_rate": [0.05, 0.1],
             "clf__num_leaves": [15, 31],
         }),
-        "Support Vector Machine": (SVC(probability=True, random_state=rs), {
-            "clf__C": [0.1, 1],
-            "clf__gamma": ["scale", "auto"],
+        # Platt-calibrated SVC; replaces SVC(probability=True), deprecated in scikit-learn 1.9
+        "Support Vector Machine": (CalibratedClassifierCV(SVC(random_state=rs), ensemble=False), {
+            "clf__estimator__C": [0.1, 1],
+            "clf__estimator__gamma": ["scale", "auto"],
         }),
         "Neural Network": (MLPClassifier(max_iter=5000, random_state=rs), {
             "clf__hidden_layer_sizes": [(50, 10), (100, 50)],
