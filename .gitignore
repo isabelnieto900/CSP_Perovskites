@@ -1,6 +1,9 @@
 .venv/
+poster/
 __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 .pytest_cache/
 results/
+Ciecias de los materiales Syllabus.pdf
+Nanotecnología y nuevos materiales syllabus.pdf
